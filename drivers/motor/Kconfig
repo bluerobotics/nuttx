@@ -82,6 +82,10 @@ endif
 
 source "drivers/motor/foc/Kconfig"
 
+source "drivers/motor/bldc/Kconfig"
+
+source "drivers/motor/gate_driver/Kconfig"
+
 endif # MOTOR
 
 menuconfig STEPPER
