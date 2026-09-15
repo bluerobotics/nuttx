@@ -40,12 +40,24 @@ if(CONFIG_ADC)
   list(APPEND SRCS stm32_adc.c)
 endif()
 
+if(CONFIG_STM32_CRC)
+  list(APPEND SRCS stm32_crc.c)
+endif()
+
 if(CONFIG_STM32_DAC)
   list(APPEND SRCS stm32_dac.c)
 endif()
 
 if(CONFIG_STM32_FDCAN_CHARDRIVER)
   list(APPEND SRCS stm32_fdcan.c)
+endif()
+
+if(CONFIG_STM32_RNG)
+  list(APPEND SRCS stm32_rng.c)
+endif()
+
+if(CONFIG_STM32_CRC)
+  list(APPEND SRCS stm32_crc.c)
 endif()
 
 if(CONFIG_STM32_ICACHE)
