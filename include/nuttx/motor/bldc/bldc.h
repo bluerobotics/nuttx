@@ -114,6 +114,8 @@ struct bldc_trap_sensorless_cfg_s
   uint16_t stall_var_threshold_deg2;
   int16_t  phase_advance_mdeg;
   int16_t  phase_advance_speed_x1000;
+  uint16_t drive_timeout_ms;    /* Stop if no drive command for this long;
+                                 * 0 disables */
 };
 
 struct bldc_trap_sensorless_state_s
@@ -166,6 +168,13 @@ struct bldc_board_ops_s
   CODE int (*commutation_apply)(FAR struct bldc_dev_s *dev,
                                 FAR const struct bldc_commutation_s *cmd);
 
+  /* Gate the whole bridge (e.g. advanced-timer MOE).  The backend enables
+   * it when it starts driving and disables it when it stops; may be called
+   * from the commutation ISR.
+   */
+
+  CODE int (*outputs_enable)(FAR struct bldc_dev_s *dev, bool enable);
+
   CODE int (*fault_clear)(FAR struct bldc_dev_s *dev);
 
   CODE int (*ioctl)(FAR struct bldc_dev_s *dev, int cmd,
@@ -173,7 +182,6 @@ struct bldc_board_ops_s
 
 #ifdef CONFIG_MOTOR_BLDC_DEBUG
 
-  CODE int (*pwm_enable)(FAR struct bldc_dev_s *dev, bool enable);
   CODE int (*pwm_set_duties)(FAR struct bldc_dev_s *dev,
                              uint16_t duty_a,
                              uint16_t duty_b,

@@ -392,12 +392,12 @@ static int bldc_handle_debug_ioctl(FAR struct bldc_dev_s *dev, int cmd,
           FAR const struct bldc_debug_pwm_output_s *o =
             (FAR const struct bldc_debug_pwm_output_s *)arg;
 
-          if (o == NULL || dev->board->pwm_enable == NULL)
+          if (o == NULL || dev->board->outputs_enable == NULL)
             {
               return -EINVAL;
             }
 
-          return dev->board->pwm_enable(dev, o->enable);
+          return dev->board->outputs_enable(dev, o->enable);
         }
 
       case BLDCIOC_DEBUG_PWM_INFO:

@@ -111,6 +111,18 @@ config MOTOR_BLDC_TRAP_SENSORLESS_PHASE_ADV_SPEED_X1000
 		Speed-proportional phase advance: dp = revs_per_tick *
 		(phase_advance_speed_x1000 / 1000).  1000 == 1.0.
 
+config MOTOR_BLDC_TRAP_SENSORLESS_DRIVE_TIMEOUT_MS
+	int "Drive command timeout [ms]"
+	default 250
+	range 0 65535
+	---help---
+		A closed-loop drive stops and floats the bridge when no
+		BLDCIOC_TRAP_SENSORLESS_DRIVE arrives for this long, so a
+		controller that dies cannot leave the motor running.  The
+		controller must refresh the drive faster than this.  0 disables
+		the timeout (e.g. for one-shot bench commands); it can also be
+		changed at run time through the sensorless cfg.
+
 endif # MOTOR_BLDC_TRAP
 
 endif # MOTOR_BLDC

@@ -86,6 +86,10 @@
 #  define CONFIG_MOTOR_BLDC_TRAP_SENSORLESS_PHASE_ADV_SPEED_X1000 730
 #endif
 
+#ifndef CONFIG_MOTOR_BLDC_TRAP_SENSORLESS_DRIVE_TIMEOUT_MS
+#  define CONFIG_MOTOR_BLDC_TRAP_SENSORLESS_DRIVE_TIMEOUT_MS   250
+#endif
+
 #define BLDC_TRAP_SENSORLESS_CORR_CLAMP   2.5e-3f
 #define BLDC_TRAP_PHASE_ERR_LPF_GAIN      0.1f
 #define BLDC_TRAP_STALL_DEBOUNCE_TRIP        2000
@@ -135,6 +139,13 @@ struct trap_priv_s
   volatile int32_t      stall_counter;
   volatile bool         stalled;
 
+  /* Closed-loop drive watchdog: ticks left before the backend stops itself
+   * for want of a fresh drive command.  Unused when the timeout is 0.
+   */
+
+  volatile uint32_t     drive_ticks_left;
+  uint32_t              drive_timeout_ticks;
+
   struct bldc_trap_sensorless_cfg_s cfg;
   float                 min_revs_per_tick;
 
@@ -143,6 +154,12 @@ struct trap_priv_s
 };
 
 static struct trap_priv_s g_default_trap;
+
+/****************************************************************************
+ * Private Function Prototypes
+ ****************************************************************************/
+
+static int trap_stop_running(FAR struct bldc_dev_s *dev);
 
 /****************************************************************************
  * Private Data
@@ -292,6 +309,20 @@ static int trap_apply_safe(FAR struct bldc_dev_s *dev)
 }
 
 /****************************************************************************
+ * Name: trap_outputs_enable
+ ****************************************************************************/
+
+static int trap_outputs_enable(FAR struct bldc_dev_s *dev, bool enable)
+{
+  if (dev->board == NULL || dev->board->outputs_enable == NULL)
+    {
+      return OK;
+    }
+
+  return dev->board->outputs_enable(dev, enable);
+}
+
+/****************************************************************************
  * Name: trap_duty_max_from_period
  ****************************************************************************/
 
@@ -339,8 +370,7 @@ unused_code static uint32_t trap_ticks_from_us(uint32_t pwm_freq,
   return (uint32_t)(((uint64_t)us * pwm_freq + 500000u) / 1000000u);
 }
 
-unused_code static uint32_t trap_ticks_from_ms(uint32_t pwm_freq,
-                                               uint32_t ms)
+static uint32_t trap_ticks_from_ms(uint32_t pwm_freq, uint32_t ms)
 {
   return (uint32_t)(((uint64_t)ms * pwm_freq + 500u) / 1000u);
 }
@@ -401,6 +431,7 @@ static int trap_set_sector(FAR struct bldc_dev_s *dev,
 {
   FAR struct trap_priv_s *priv = trap_priv(dev);
   uint8_t                 seg;
+  int                     ret;
 
   if (sector >= BLDC_TRAP_NSECTORS)
     {
@@ -419,7 +450,17 @@ static int trap_set_sector(FAR struct bldc_dev_s *dev,
   priv->m_mech_revs = ((float)seg + 0.5f) / (float)BLDC_TRAP_NSEGMENTS;
   priv->duty        = duty;
 
-  return apply_table_drive(dev, seg, duty);
+  /* Every path that drives the bridge comes through here, so this is where
+   * the bridge is ungated; trap_stop_running() gates it again.
+   */
+
+  ret = apply_table_drive(dev, seg, duty);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  return trap_outputs_enable(dev, true);
 }
 
 /****************************************************************************
@@ -604,6 +645,24 @@ static void trap_load_default_cfg(FAR struct trap_priv_s *priv)
       CONFIG_MOTOR_BLDC_TRAP_SENSORLESS_PHASE_ADVANCE_MDEG;
   priv->cfg.phase_advance_speed_x1000 =
       CONFIG_MOTOR_BLDC_TRAP_SENSORLESS_PHASE_ADV_SPEED_X1000;
+  priv->cfg.drive_timeout_ms         =
+      CONFIG_MOTOR_BLDC_TRAP_SENSORLESS_DRIVE_TIMEOUT_MS;
+}
+
+/****************************************************************************
+ * Name: trap_kick_drive_timeout
+ *
+ * Description:
+ *   Re-arm the closed-loop drive watchdog.  Caller holds the critical
+ *   section.
+ *
+ ****************************************************************************/
+
+static inline void trap_kick_drive_timeout(FAR struct trap_priv_s *priv)
+{
+  priv->drive_timeout_ticks = trap_ticks_from_ms(priv->pwm_freq,
+                                                 priv->cfg.drive_timeout_ms);
+  priv->drive_ticks_left    = priv->drive_timeout_ticks;
 }
 
 /****************************************************************************
@@ -756,6 +815,22 @@ static void trap_commutation_tick(FAR struct bldc_dev_s *dev,
     }
 
   closed_loop = (priv->state != BLDC_TRAP_STATE_FIXED);
+
+  /* A closed-loop drive only keeps running while its controller keeps
+   * sending drive commands; if the controller dies, float the bridge
+   * rather than hold the last duty forever.
+   */
+
+  if (closed_loop && priv->drive_timeout_ticks != 0)
+    {
+      if (priv->drive_ticks_left == 0)
+        {
+          (void)trap_stop_running(dev);
+          return;
+        }
+
+      priv->drive_ticks_left--;
+    }
 
   if (closed_loop)
     {
@@ -994,6 +1069,7 @@ static int trap_start_closed_loop(FAR struct bldc_dev_s *dev,
   priv->speed_correction_lpf = 0.0f;
   priv->stall_counter        = 0;
   priv->stalled              = false;
+  trap_kick_drive_timeout(priv);
 
   priv->running              = true;
   leave_critical_section(flags);
@@ -1059,6 +1135,7 @@ static int trap_update_drive(FAR struct bldc_dev_s *dev,
   priv->direction  = cw ? BLDC_DIR_FORWARD : BLDC_DIR_REVERSE;
   priv->amp_q15    = amplitude_q15;
   priv->duty       = duty;
+  trap_kick_drive_timeout(priv);
   leave_critical_section(flags);
 
   return OK;
@@ -1072,6 +1149,7 @@ static int trap_stop_running(FAR struct bldc_dev_s *dev)
 {
   FAR struct trap_priv_s *priv = trap_priv(dev);
   irqstate_t              flags;
+  int                     ret;
 
   flags = enter_critical_section();
   priv->running              = false;
@@ -1083,7 +1161,9 @@ static int trap_stop_running(FAR struct bldc_dev_s *dev)
   priv->stall_counter        = 0;
   leave_critical_section(flags);
 
-  return trap_apply_safe(dev);
+  ret = trap_apply_safe(dev);
+  (void)trap_outputs_enable(dev, false);
+  return ret;
 }
 
 #ifdef CONFIG_MOTOR_BLDC_DEBUG
@@ -1156,6 +1236,7 @@ static int trap_setup(FAR struct bldc_dev_s *dev)
                                      priv->cfg.min_rps_electrical);
 
   (void)trap_apply_safe(dev);
+  (void)trap_outputs_enable(dev, false);
   return OK;
 }
 
@@ -1164,8 +1245,9 @@ static int trap_shutdown(FAR struct bldc_dev_s *dev)
   /* Deliberate no-op for NSH-style use (open -> ioctl -> close per command).
    * br_pwm closes /dev/motor0 after every invocation; tearing the backend
    * down here would stop a running commutation and wipe trap state/cfg
-   * before the next command.  Explicit stop: BLDCIOC_DEBUG_TRAP_STOP,
-   * BLDCIOC_TRAP_SENSORLESS_DRIVE amp=0, or br_pwm motor stop / off.
+   * before the next command.  Explicit stop: MTRIOC_STOP or
+   * BLDCIOC_DEBUG_TRAP_STOP; a closed-loop drive also stops itself once
+   * drive commands stop arriving (cfg.drive_timeout_ms).
    *
    * board_motor_shutdown() is also a no-op so TIM8/DRV/ADC stay armed.
    */
@@ -1361,6 +1443,7 @@ static int trap_ioctl(FAR struct bldc_dev_s *dev, int cmd,
           priv->min_revs_per_tick =
               trap_compute_min_revs_per_tick(priv->pwm_freq,
                                              priv->cfg.min_rps_electrical);
+          trap_kick_drive_timeout(priv);
           leave_critical_section(flags);
           return OK;
         }
