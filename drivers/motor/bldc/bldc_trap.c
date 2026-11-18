@@ -33,6 +33,7 @@
 
 #include <nuttx/debug.h>
 #include <nuttx/irq.h>
+#include <nuttx/kmalloc.h>
 
 #include <nuttx/motor/bldc/bldc.h>
 #include <nuttx/motor/motor.h>
@@ -158,10 +159,6 @@ struct trap_priv_s
   uint32_t              freq_hz;                /* FIXED-mode setpoint */
 };
 
-/* The backend drives a single motor; dev->backend_priv is not used. */
-
-static struct trap_priv_s g_trap;
-
 /****************************************************************************
  * Private Function Prototypes
  ****************************************************************************/
@@ -219,8 +216,8 @@ static inline uint8_t trap_seg_from_sector(uint8_t sector)
 
 static inline FAR struct trap_priv_s *trap_priv(FAR struct bldc_dev_s *dev)
 {
-  (void)dev;
-  return &g_trap;
+  DEBUGASSERT(dev->backend_priv != NULL);
+  return (FAR struct trap_priv_s *)dev->backend_priv;
 }
 
 /****************************************************************************
@@ -1563,7 +1560,29 @@ static const struct bldc_backend_ops_s g_bldc_trap_ops =
  * Public Functions
  ****************************************************************************/
 
-FAR const struct bldc_backend_ops_s *bldc_trap_get_ops(void)
+/****************************************************************************
+ * Name: bldc_trap_initialize
+ *
+ * Description:
+ *   Make the trapezoidal backend the one that drives dev, with its own
+ *   state.  Call before bldc_register(): the board may start calling
+ *   bldc_commutation_tick() as soon as the device is first opened.
+ *
+ ****************************************************************************/
+
+int bldc_trap_initialize(FAR struct bldc_dev_s *dev)
 {
-  return &g_bldc_trap_ops;
+  FAR struct trap_priv_s *priv;
+
+  DEBUGASSERT(dev != NULL);
+
+  priv = kmm_zalloc(sizeof(struct trap_priv_s));
+  if (priv == NULL)
+    {
+      return -ENOMEM;
+    }
+
+  dev->backend      = &g_bldc_trap_ops;
+  dev->backend_priv = priv;
+  return OK;
 }

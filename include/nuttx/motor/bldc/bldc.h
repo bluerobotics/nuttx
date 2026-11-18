@@ -279,7 +279,7 @@ bldc_commutation_tick(FAR struct bldc_dev_s *dev,
  ****************************************************************************/
 
 #ifdef CONFIG_MOTOR_BLDC_TRAP
-FAR const struct bldc_backend_ops_s *bldc_trap_get_ops(void);
+int bldc_trap_initialize(FAR struct bldc_dev_s *dev);
 #endif
 
 #ifdef __cplusplus
