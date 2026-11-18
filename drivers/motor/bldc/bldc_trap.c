@@ -113,6 +113,7 @@ struct trap_priv_s
   volatile uint8_t      seg;
   int8_t                direction;
   volatile uint16_t     duty;
+  uint16_t              applied_duty;   /* Duty last written to the bridge */
   uint16_t              duty_max;
   volatile uint32_t     commutations;
 
@@ -276,6 +277,7 @@ static int apply_table_drive(FAR struct bldc_dev_s *dev,
                              uint8_t seg, uint16_t duty)
 {
   struct bldc_commutation_s cmd;
+  int                       ret;
 
   if (dev->board == NULL || dev->board->commutation_apply == NULL)
     {
@@ -283,7 +285,13 @@ static int apply_table_drive(FAR struct bldc_dev_s *dev,
     }
 
   trap_fill_commutation_seg(&cmd, seg, duty);
-  return dev->board->commutation_apply(dev, &cmd);
+  ret = dev->board->commutation_apply(dev, &cmd);
+  if (ret == OK)
+    {
+      trap_priv(dev)->applied_duty = duty;
+    }
+
+  return ret;
 }
 
 /****************************************************************************
@@ -867,6 +875,15 @@ static void trap_commutation_tick(FAR struct bldc_dev_s *dev,
                                       trap_seg_from_sector(0)) /
                                      2u % BLDC_TRAP_NSECTORS);
       priv->commutations++;
+    }
+  else if (priv->duty != priv->applied_duty)
+    {
+      /* A new drive command changed the duty mid-segment; apply it now
+       * rather than at the next segment boundary, which is a long way off
+       * at low speed and never comes on a stalled rotor.
+       */
+
+      (void)apply_table_drive(dev, seg, priv->duty);
     }
 
   if (adc != NULL)

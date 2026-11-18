@@ -170,7 +170,9 @@ struct bldc_board_ops_s
 
   /* Gate the whole bridge (e.g. advanced-timer MOE).  The backend enables
    * it when it starts driving and disables it when it stops; may be called
-   * from the commutation ISR.
+   * from the commutation ISR.  Enabling may fail with -EBUSY if the board
+   * is using the bridge for something else; disabling always succeeds.
+   * commutation_apply() may likewise refuse a driving pattern with -EBUSY.
    */
 
   CODE int (*outputs_enable)(FAR struct bldc_dev_s *dev, bool enable);
