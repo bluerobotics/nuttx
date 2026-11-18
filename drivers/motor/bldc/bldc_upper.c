@@ -159,7 +159,6 @@ static int bldc_shutdown(FAR struct motor_lowerhalf_s *lower)
       dev->board->shutdown(dev);
     }
 
-  dev->running = false;
   return OK;
 }
 
@@ -177,11 +176,6 @@ static int bldc_start(FAR struct motor_lowerhalf_s *lower)
   if (dev->backend->start != NULL)
     {
       ret = dev->backend->start(dev);
-    }
-
-  if (ret == OK)
-    {
-      dev->running = true;
     }
 
   return ret;
@@ -203,7 +197,6 @@ static int bldc_stop(FAR struct motor_lowerhalf_s *lower)
       ret = dev->backend->stop(dev);
     }
 
-  dev->running = false;
   return ret;
 }
 
@@ -530,8 +523,6 @@ int bldc_register(FAR const char *path, FAR struct bldc_dev_s *dev)
   dev->lower.state.control_mode = dev->backend->control_mode;
   dev->lower.state.capabilities = dev->backend->capabilities |
                                   dev->capabilities;
-
-  dev->running = false;
 
   return motor_register(path, &dev->lower);
 }

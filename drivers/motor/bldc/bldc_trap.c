@@ -119,13 +119,11 @@ struct trap_priv_s
 
   volatile float        m_mech_revs;
   volatile float        m_mech_revs_per_tick;
-  uint32_t              m_period_ticks;
 
   volatile float        zcd_acc_before;
   volatile float        zcd_acc_after;
   volatile uint8_t      zcd_last_seg;
   volatile bool         zcd_have_first;
-  volatile float        phase_err_rev;
   volatile float        phase_err_deg;
   volatile float        phase_err_deg_mean;
   volatile float        phase_err_sq_mean;
@@ -135,8 +133,6 @@ struct trap_priv_s
   volatile bool         desired_cw;
   volatile bool         reset_speed;
   volatile float        mech_revs_rate_boost;
-  volatile float        speed_correction;
-  volatile float        speed_correction_lpf;
   volatile int32_t      stall_counter;
   volatile bool         stalled;
 
@@ -148,13 +144,23 @@ struct trap_priv_s
   uint32_t              drive_timeout_ticks;
 
   struct bldc_trap_sensorless_cfg_s cfg;
+
+  /* cfg converted for the commutation tick by trap_apply_cfg() */
+
   float                 min_revs_per_tick;
+  float                 speed_kp;
+  float                 boost_kp;
+  float                 boost_decay;
+  float                 phase_adv_rev;          /* Static advance [rev] */
+  float                 phase_adv_speed_gain;
 
   uint32_t              pwm_freq;
-  uint32_t              freq_hz;
+  uint32_t              freq_hz;                /* FIXED-mode setpoint */
 };
 
-static struct trap_priv_s g_default_trap;
+/* The backend drives a single motor; dev->backend_priv is not used. */
+
+static struct trap_priv_s g_trap;
 
 /****************************************************************************
  * Private Function Prototypes
@@ -213,9 +219,8 @@ static inline uint8_t trap_seg_from_sector(uint8_t sector)
 
 static inline FAR struct trap_priv_s *trap_priv(FAR struct bldc_dev_s *dev)
 {
-  return (dev->backend_priv != NULL)
-         ? (FAR struct trap_priv_s *)dev->backend_priv
-         : &g_default_trap;
+  (void)dev;
+  return &g_trap;
 }
 
 /****************************************************************************
@@ -348,35 +353,26 @@ static uint16_t trap_duty_max_from_period(uint16_t period)
 }
 
 /****************************************************************************
- * Name: trap_compute_duty_max
+ * Name: trap_duty_from_q15
+ *
+ * Description:
+ *   Scale a signed Q15 drive amplitude to a timer duty, 0 .. duty_max.
+ *
  ****************************************************************************/
 
-static int trap_compute_duty_max(FAR struct bldc_dev_s *dev,
-                                  FAR uint16_t *duty_max)
+static uint16_t trap_duty_from_q15(FAR const struct trap_priv_s *priv,
+                                   int16_t amplitude_q15)
 {
-  uint32_t pwm_freq;
-  uint16_t period;
-  int      ret;
+  uint32_t mag = (amplitude_q15 < 0) ? (uint32_t)(-amplitude_q15)
+                                     : (uint32_t)amplitude_q15;
+  uint32_t d   = (mag * priv->duty_max) / BLDC_TRAP_Q15_FULLSCALE;
 
-  ret = trap_get_pwm_info(dev, &pwm_freq, &period);
-  if (ret < 0)
-    {
-      return ret;
-    }
-
-  *duty_max = trap_duty_max_from_period(period);
-  return OK;
+  return (d > priv->duty_max) ? priv->duty_max : (uint16_t)d;
 }
 
 /****************************************************************************
- * Name: trap_ticks_from_us / trap_ticks_from_ms
+ * Name: trap_ticks_from_ms
  ****************************************************************************/
-
-unused_code static uint32_t trap_ticks_from_us(uint32_t pwm_freq,
-                                               uint32_t us)
-{
-  return (uint32_t)(((uint64_t)us * pwm_freq + 500000u) / 1000000u);
-}
 
 static uint32_t trap_ticks_from_ms(uint32_t pwm_freq, uint32_t ms)
 {
@@ -658,6 +654,63 @@ static void trap_load_default_cfg(FAR struct trap_priv_s *priv)
 }
 
 /****************************************************************************
+ * Name: trap_apply_cfg
+ *
+ * Description:
+ *   Convert cfg and pwm_freq into the values the commutation tick uses, so
+ *   it does no integer-to-float conversion of its own.  Caller holds the
+ *   critical section.
+ *
+ ****************************************************************************/
+
+static void trap_apply_cfg(FAR struct trap_priv_s *priv)
+{
+  priv->min_revs_per_tick    =
+      trap_compute_min_revs_per_tick(priv->pwm_freq,
+                                     priv->cfg.min_rps_electrical);
+  priv->speed_kp             = (float)priv->cfg.speed_kp_x1000 / 1000.0f;
+  priv->boost_kp             = (float)priv->cfg.boost_kp_x1000 / 1000.0f;
+  priv->boost_decay          = (float)priv->cfg.boost_decay_x1000 / 1000.0f;
+  priv->phase_adv_rev        = (float)priv->cfg.phase_advance_mdeg /
+                               (1000.0f * 360.0f);
+  priv->phase_adv_speed_gain =
+      (float)priv->cfg.phase_advance_speed_x1000 / 1000.0f;
+  priv->drive_timeout_ticks  =
+      trap_ticks_from_ms(priv->pwm_freq, priv->cfg.drive_timeout_ms);
+}
+
+/****************************************************************************
+ * Name: trap_refresh_pwm
+ *
+ * Description:
+ *   Read the board's PWM frequency and period, and recompute everything
+ *   that depends on them.
+ *
+ ****************************************************************************/
+
+static int trap_refresh_pwm(FAR struct bldc_dev_s *dev,
+                            FAR struct trap_priv_s *priv)
+{
+  irqstate_t flags;
+  uint32_t   pwm_freq;
+  uint16_t   period;
+  int        ret;
+
+  ret = trap_get_pwm_info(dev, &pwm_freq, &period);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  flags = enter_critical_section();
+  priv->pwm_freq = pwm_freq;
+  priv->duty_max = trap_duty_max_from_period(period);
+  trap_apply_cfg(priv);
+  leave_critical_section(flags);
+  return OK;
+}
+
+/****************************************************************************
  * Name: trap_kick_drive_timeout
  *
  * Description:
@@ -668,9 +721,7 @@ static void trap_load_default_cfg(FAR struct trap_priv_s *priv)
 
 static inline void trap_kick_drive_timeout(FAR struct trap_priv_s *priv)
 {
-  priv->drive_timeout_ticks = trap_ticks_from_ms(priv->pwm_freq,
-                                                 priv->cfg.drive_timeout_ms);
-  priv->drive_ticks_left    = priv->drive_timeout_ticks;
+  priv->drive_ticks_left = priv->drive_timeout_ticks;
 }
 
 /****************************************************************************
@@ -709,20 +760,10 @@ static inline void trap_apply_regulator(FAR struct trap_priv_s *priv,
   float dir_sign  = priv->desired_cw ? 1.0f : -1.0f;
   float corr      = -err_rev * clamp_mag;
 
-  priv->speed_correction      = corr;
-  priv->speed_correction_lpf += (corr - priv->speed_correction_lpf) * 1.0f;
-
   if (priv->amp_q15 != 0)
     {
-      float kp_speed = (float)priv->cfg.speed_kp_x1000 * (1.0f / 1000.0f);
-      float kp_boost = (float)priv->cfg.boost_kp_x1000 * (1.0f / 1000.0f);
-
-      priv->m_mech_revs_per_tick += dir_sign *
-                                    priv->speed_correction_lpf *
-                                    kp_speed;
-      priv->mech_revs_rate_boost  = dir_sign *
-                                    priv->speed_correction_lpf *
-                                    kp_boost;
+      priv->m_mech_revs_per_tick += dir_sign * corr * priv->speed_kp;
+      priv->mech_revs_rate_boost  = dir_sign * corr * priv->boost_kp;
 
       if (!priv->stalled)
         {
@@ -813,7 +854,6 @@ static void trap_commutation_tick(FAR struct bldc_dev_s *dev,
 {
   FAR struct trap_priv_s *priv = trap_priv(dev);
   float                   phase;
-  float                   boost_decay;
   uint8_t                 seg;
   bool                    closed_loop;
 
@@ -850,8 +890,7 @@ static void trap_commutation_tick(FAR struct bldc_dev_s *dev,
 
   if (closed_loop)
     {
-      boost_decay = (float)priv->cfg.boost_decay_x1000 * (1.0f / 1000.0f);
-      priv->mech_revs_rate_boost *= boost_decay;
+      priv->mech_revs_rate_boost *= priv->boost_decay;
     }
   else
     {
@@ -895,20 +934,13 @@ static void trap_commutation_tick(FAR struct bldc_dev_s *dev,
         {
           float err_deg = err_rev * 360.0f;
 
-          priv->phase_err_rev = err_rev;
           priv->phase_err_deg = err_deg;
           trap_update_phase_err_stats(priv, err_deg);
 
           if (closed_loop)
             {
-              float static_rev =
-                  (float)priv->cfg.phase_advance_mdeg *
-                  (1.0f / (1000.0f * 360.0f));
-              float speed_gain =
-                  (float)priv->cfg.phase_advance_speed_x1000 *
-                  (1.0f / 1000.0f);
-              float dp = priv->m_mech_revs_per_tick * speed_gain +
-                         static_rev;
+              float dp = priv->m_mech_revs_per_tick *
+                         priv->phase_adv_speed_gain + priv->phase_adv_rev;
               float adv_err = err_rev + dp;
 
               trap_update_stall_detection(priv);
@@ -916,6 +948,64 @@ static void trap_commutation_tick(FAR struct bldc_dev_s *dev,
             }
         }
     }
+}
+
+/****************************************************************************
+ * Name: trap_reset_state
+ *
+ * Description:
+ *   Park the model at sector 0 and clear the estimator, ready for a new
+ *   run.  Caller holds the critical section.
+ *
+ ****************************************************************************/
+
+static void trap_reset_state(FAR struct trap_priv_s *priv)
+{
+  priv->mech_revs_rate_boost = 0.0f;
+  priv->sector               = 0;
+  priv->seg                  = trap_seg_from_sector(0);
+  priv->m_mech_revs          = ((float)priv->seg + 0.5f) /
+                               (float)BLDC_TRAP_NSEGMENTS;
+  priv->commutations         = 0;
+
+  priv->zcd_acc_before       = 0.0f;
+  priv->zcd_acc_after        = 0.0f;
+  priv->zcd_last_seg         = priv->seg;
+  priv->zcd_have_first       = false;
+  priv->phase_err_deg        = 0.0f;
+  priv->phase_err_deg_mean   = 0.0f;
+  priv->phase_err_sq_mean    = 0.0f;
+  priv->phase_err_var_deg2   = 0.0f;
+  priv->stall_counter        = 0;
+  priv->stalled              = false;
+}
+
+/****************************************************************************
+ * Name: trap_begin
+ *
+ * Description:
+ *   Drive sector 0 for a run the caller has just set up and marked
+ *   running.  On failure, go back to idle with the bridge floating.
+ *
+ ****************************************************************************/
+
+static int trap_begin(FAR struct bldc_dev_s *dev, uint16_t duty)
+{
+  FAR struct trap_priv_s *priv = trap_priv(dev);
+  irqstate_t              flags;
+  int                     ret;
+
+  ret = trap_set_sector(dev, 0, duty);
+  if (ret < 0)
+    {
+      flags = enter_critical_section();
+      priv->running = false;
+      priv->state   = BLDC_TRAP_STATE_IDLE;
+      leave_critical_section(flags);
+      (void)trap_apply_safe(dev);
+    }
+
+  return ret;
 }
 
 /****************************************************************************
@@ -929,8 +1019,6 @@ static int trap_start_running(FAR struct bldc_dev_s *dev,
 {
   FAR struct trap_priv_s *priv = trap_priv(dev);
   irqstate_t              flags;
-  uint32_t                pwm_freq;
-  uint16_t                period;
   int                     ret;
 
   if (!priv->armed)
@@ -943,14 +1031,11 @@ static int trap_start_running(FAR struct bldc_dev_s *dev,
       return -ENOSYS;
     }
 
-  ret = trap_get_pwm_info(dev, &pwm_freq, &period);
+  ret = trap_refresh_pwm(dev, priv);
   if (ret < 0)
     {
       return ret;
     }
-
-  priv->pwm_freq = pwm_freq;
-  priv->duty_max = trap_duty_max_from_period(period);
 
   if (duty > priv->duty_max)
     {
@@ -963,41 +1048,14 @@ static int trap_start_running(FAR struct bldc_dev_s *dev,
                                                : BLDC_DIR_FORWARD;
   priv->duty                 = duty;
   priv->freq_hz              = freq_hz;
-  priv->m_mech_revs_per_tick = trap_compute_revs_per_tick(pwm_freq,
+  priv->m_mech_revs_per_tick = trap_compute_revs_per_tick(priv->pwm_freq,
                                                           freq_hz,
                                                           priv->direction);
-  priv->m_period_ticks       = trap_phase_to_period_ticks(
-                                  priv->m_mech_revs_per_tick);
-  priv->sector               = 0;
-  priv->seg                  = trap_seg_from_sector(0);
-  priv->m_mech_revs          = ((float)priv->seg + 0.5f) /
-                               (float)BLDC_TRAP_NSEGMENTS;
-  priv->commutations         = 0;
-
-  priv->zcd_acc_before       = 0.0f;
-  priv->zcd_acc_after        = 0.0f;
-  priv->zcd_last_seg         = priv->seg;
-  priv->zcd_have_first       = false;
-  priv->phase_err_rev        = 0.0f;
-  priv->phase_err_deg        = 0.0f;
-  priv->phase_err_deg_mean   = 0.0f;
-  priv->phase_err_sq_mean    = 0.0f;
-  priv->phase_err_var_deg2   = 0.0f;
-
+  trap_reset_state(priv);
   priv->running              = true;
   leave_critical_section(flags);
 
-  ret = trap_set_sector(dev, 0, duty);
-  if (ret < 0)
-    {
-      flags = enter_critical_section();
-      priv->running = false;
-      priv->state   = BLDC_TRAP_STATE_IDLE;
-      leave_critical_section(flags);
-      (void)trap_apply_safe(dev);
-    }
-
-  return ret;
+  return trap_begin(dev, duty);
 }
 
 /****************************************************************************
@@ -1009,11 +1067,8 @@ static int trap_start_closed_loop(FAR struct bldc_dev_s *dev,
 {
   FAR struct trap_priv_s *priv = trap_priv(dev);
   irqstate_t              flags;
-  uint32_t                pwm_freq;
-  uint16_t                period;
   uint16_t                duty;
   bool                    cw;
-  int8_t                  direction;
   int                     ret;
 
   if (!priv->armed)
@@ -1026,82 +1081,30 @@ static int trap_start_closed_loop(FAR struct bldc_dev_s *dev,
       return -ENOSYS;
     }
 
-  ret = trap_get_pwm_info(dev, &pwm_freq, &period);
+  ret = trap_refresh_pwm(dev, priv);
   if (ret < 0)
     {
       return ret;
     }
 
-  priv->pwm_freq          = pwm_freq;
-  priv->duty_max          = trap_duty_max_from_period(period);
-  priv->min_revs_per_tick = trap_compute_min_revs_per_tick(
-                                pwm_freq, priv->cfg.min_rps_electrical);
-
-  if (amplitude_q15 != 0)
-    {
-      uint32_t mag = (amplitude_q15 < 0) ? (uint32_t)(-amplitude_q15)
-                                         : (uint32_t)amplitude_q15;
-      uint32_t d   = (mag * priv->duty_max) / BLDC_TRAP_Q15_FULLSCALE;
-
-      duty = (d > priv->duty_max) ? priv->duty_max : (uint16_t)d;
-    }
-  else
-    {
-      duty = 0;
-    }
-
-  cw        = (amplitude_q15 >= 0);
-  direction = cw ? BLDC_DIR_FORWARD : BLDC_DIR_REVERSE;
+  duty = trap_duty_from_q15(priv, amplitude_q15);
+  cw   = (amplitude_q15 >= 0);
 
   flags = enter_critical_section();
-
   priv->state                = BLDC_TRAP_STATE_CREEP;
-  priv->direction            = direction;
+  priv->direction            = cw ? BLDC_DIR_FORWARD : BLDC_DIR_REVERSE;
   priv->desired_cw           = cw;
   priv->reset_speed          = true;
   priv->amp_q15              = amplitude_q15;
   priv->duty                 = duty;
-  priv->freq_hz              = priv->cfg.min_rps_electrical;
   priv->m_mech_revs_per_tick = cw ?  priv->min_revs_per_tick
                                   : -priv->min_revs_per_tick;
-  priv->mech_revs_rate_boost = 0.0f;
-  priv->m_period_ticks       = trap_phase_to_period_ticks(
-                                  priv->m_mech_revs_per_tick);
-  priv->sector               = 0;
-  priv->seg                  = trap_seg_from_sector(0);
-  priv->m_mech_revs          = ((float)priv->seg + 0.5f) /
-                               (float)BLDC_TRAP_NSEGMENTS;
-  priv->commutations         = 0;
-
-  priv->zcd_acc_before       = 0.0f;
-  priv->zcd_acc_after        = 0.0f;
-  priv->zcd_last_seg         = priv->seg;
-  priv->zcd_have_first       = false;
-  priv->phase_err_rev        = 0.0f;
-  priv->phase_err_deg        = 0.0f;
-  priv->phase_err_deg_mean   = 0.0f;
-  priv->phase_err_sq_mean    = 0.0f;
-  priv->phase_err_var_deg2   = 0.0f;
-  priv->speed_correction     = 0.0f;
-  priv->speed_correction_lpf = 0.0f;
-  priv->stall_counter        = 0;
-  priv->stalled              = false;
+  trap_reset_state(priv);
   trap_kick_drive_timeout(priv);
-
   priv->running              = true;
   leave_critical_section(flags);
 
-  ret = trap_set_sector(dev, 0, duty);
-  if (ret < 0)
-    {
-      flags = enter_critical_section();
-      priv->running = false;
-      priv->state   = BLDC_TRAP_STATE_IDLE;
-      leave_critical_section(flags);
-      (void)trap_apply_safe(dev);
-    }
-
-  return ret;
+  return trap_begin(dev, duty);
 }
 
 /****************************************************************************
@@ -1126,20 +1129,8 @@ static int trap_update_drive(FAR struct bldc_dev_s *dev,
       return -EBUSY;
     }
 
-  if (amplitude_q15 != 0)
-    {
-      uint32_t mag = (amplitude_q15 < 0) ? (uint32_t)(-amplitude_q15)
-                                         : (uint32_t)amplitude_q15;
-      uint32_t d   = (mag * priv->duty_max) / BLDC_TRAP_Q15_FULLSCALE;
-
-      duty = (d > priv->duty_max) ? priv->duty_max : (uint16_t)d;
-    }
-  else
-    {
-      duty = 0;
-    }
-
-  cw = (amplitude_q15 >= 0);
+  duty = trap_duty_from_q15(priv, amplitude_q15);
+  cw   = (amplitude_q15 >= 0);
 
   flags = enter_critical_section();
 
@@ -1193,18 +1184,21 @@ static void trap_status_get(FAR struct bldc_dev_s *dev,
 {
   FAR struct trap_priv_s *priv = trap_priv(dev);
   irqstate_t              flags;
+  float                   revs_per_tick;
 
   DEBUGASSERT(s != NULL);
 
   flags = enter_critical_section();
+  revs_per_tick           = priv->m_mech_revs_per_tick;
   s->running              = priv->running;
   s->state                = priv->state;
   s->sector               = priv->sector;
   s->direction            = priv->direction;
   s->duty                 = priv->duty;
   s->duty_max             = priv->duty_max;
-  s->freq_electrical_hz   = priv->freq_hz;
-  s->isr_ticks_per_sector = priv->m_period_ticks;
+  s->freq_electrical_hz   = (uint32_t)(fabsf(revs_per_tick) *
+                                       (float)priv->pwm_freq);
+  s->isr_ticks_per_sector = trap_phase_to_period_ticks(revs_per_tick);
   s->commutations         = priv->commutations;
   leave_critical_section(flags);
 }
@@ -1217,8 +1211,6 @@ static void trap_status_get(FAR struct bldc_dev_s *dev,
 static int trap_setup(FAR struct bldc_dev_s *dev)
 {
   FAR struct trap_priv_s *priv = trap_priv(dev);
-  uint32_t                pwm_freq;
-  uint16_t                period;
   int                     ret;
 
   if (priv->armed)
@@ -1227,30 +1219,18 @@ static int trap_setup(FAR struct bldc_dev_s *dev)
     }
 
   memset(priv, 0, sizeof(*priv));
-  priv->armed     = true;
   priv->state     = BLDC_TRAP_STATE_IDLE;
   priv->direction = BLDC_DIR_FORWARD;
 
   trap_load_default_cfg(priv);
 
-  ret = trap_compute_duty_max(dev, &priv->duty_max);
+  ret = trap_refresh_pwm(dev, priv);
   if (ret < 0)
     {
-      priv->armed = false;
       return ret;
     }
 
-  ret = trap_get_pwm_info(dev, &pwm_freq, &period);
-  if (ret < 0)
-    {
-      priv->armed = false;
-      return ret;
-    }
-
-  priv->pwm_freq          = pwm_freq;
-  priv->min_revs_per_tick =
-      trap_compute_min_revs_per_tick(pwm_freq,
-                                     priv->cfg.min_rps_electrical);
+  priv->armed = true;
 
   (void)trap_apply_safe(dev);
   (void)trap_outputs_enable(dev, false);
@@ -1259,14 +1239,10 @@ static int trap_setup(FAR struct bldc_dev_s *dev)
 
 static int trap_shutdown(FAR struct bldc_dev_s *dev)
 {
-  /* Deliberate no-op for NSH-style use (open -> ioctl -> close per command).
-   * br_pwm closes /dev/motor0 after every invocation; tearing the backend
-   * down here would stop a running commutation and wipe trap state/cfg
-   * before the next command.  Explicit stop: MTRIOC_STOP or
-   * BLDCIOC_DEBUG_TRAP_STOP; a closed-loop drive also stops itself once
-   * drive commands stop arriving (cfg.drive_timeout_ms).
-   *
-   * board_motor_shutdown() is also a no-op so TIM8/DRV/ADC stay armed.
+  /* Deliberate no-op, so a motor started by a short-lived command (open,
+   * ioctl, close) keeps running and keeps its state and cfg.  Stop it with
+   * MTRIOC_STOP or BLDCIOC_DEBUG_TRAP_STOP; a closed-loop drive also stops
+   * itself once drive commands stop arriving (cfg.drive_timeout_ms).
    */
 
   (void)dev;
@@ -1457,9 +1433,7 @@ static int trap_ioctl(FAR struct bldc_dev_s *dev, int cmd,
 
           flags = enter_critical_section();
           priv->cfg = *c;
-          priv->min_revs_per_tick =
-              trap_compute_min_revs_per_tick(priv->pwm_freq,
-                                             priv->cfg.min_rps_electrical);
+          trap_apply_cfg(priv);
           trap_kick_drive_timeout(priv);
           leave_critical_section(flags);
           return OK;

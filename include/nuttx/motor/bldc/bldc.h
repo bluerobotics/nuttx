@@ -151,7 +151,7 @@ struct bldc_dev_s;
  *
  * The trapezoidal backend keeps commutation state across close (shutdown is
  * a no-op) so NSH builtins can open, ioctl, and close without stopping the
- * motor.  Use the trap stop ioctls or br_pwm motor stop / off to halt.
+ * motor.  Use MTRIOC_STOP or the trap stop ioctl to halt.
  *
  * Board shutdown hooks should likewise avoid disarming hardware that is
  * expensive to bring back (PWM, gate driver, ADC).
@@ -242,8 +242,6 @@ struct bldc_dev_s
   FAR void                            *backend_priv;
 
   uint32_t                             capabilities;
-
-  bool                                 running;
 };
 
 /****************************************************************************
