@@ -132,22 +132,19 @@ static int motor_open(FAR struct file *filep)
               /* Yes.. perform one time hardware initialization. */
 
               ret = lower->ops->setup(lower);
-            }
-          else
-            {
-              ret = OK;
-            }
+              if (ret == OK)
+                {
+                  /* Save the new open count on success */
 
-          if (ret == OK)
-            {
-              upper->ocount = tmp;
+                  upper->ocount = tmp;
+                }
             }
         }
 
       nxmutex_unlock(&upper->closelock);
     }
 
-  return ret;
+  return OK;
 }
 
 /****************************************************************************

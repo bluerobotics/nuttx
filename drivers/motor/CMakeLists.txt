@@ -20,9 +20,7 @@
 #
 # ##############################################################################
 
-if(CONFIG_MOTOR_FOC
-   OR CONFIG_MOTOR_GATE_DRIVER
-   OR CONFIG_MOTOR_BLDC)
+if(CONFIG_MOTOR_FOC)
   nuttx_add_subdirectory()
 endif()
 
