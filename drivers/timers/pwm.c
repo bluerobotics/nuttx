@@ -79,6 +79,7 @@ static ssize_t pwm_write(FAR struct file *filep, FAR const char *buffer,
 static int     pwm_start(FAR struct pwm_upperhalf_s *upper,
                          unsigned int oflags);
 static int     pwm_ioctl(FAR struct file *filep, int cmd, unsigned long arg);
+static int     pwm_unlink(FAR struct inode *inode);
 
 /****************************************************************************
  * Private Data
@@ -92,6 +93,14 @@ static const struct file_operations g_pwmops =
   pwm_write, /* write */
   NULL,      /* seek */
   pwm_ioctl, /* ioctl */
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+#ifndef CONFIG_DISABLE_PSEUDOFS_OPERATIONS
+  pwm_unlink,
+#endif
 };
 
 /****************************************************************************
@@ -551,6 +560,25 @@ static int pwm_ioctl(FAR struct file *filep, int cmd, unsigned long arg)
 
   nxmutex_unlock(&upper->lock);
   return ret;
+}
+
+/****************************************************************************
+ * Name: pwm_unlink
+ *
+ * Description:
+ *   Handle PWM upper-half deinitialization and triggers lower-half
+ *   deinitialization with pwm_ops_s.shutdown. 
+ *
+ ****************************************************************************/
+
+static int pwm_unlink(FAR struct inode *inode) 
+{
+  FAR struct pwm_upperhalf_s *upper = inode->i_private;
+  FAR struct pwm_lowerhalf_s *lower = upper->dev;
+  int                         ret;
+
+  // TODO free all resources associated with the PWM upper half
+  // Probably just *upper
 }
 
 /****************************************************************************
