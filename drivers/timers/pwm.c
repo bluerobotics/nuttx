@@ -566,19 +566,34 @@ static int pwm_ioctl(FAR struct file *filep, int cmd, unsigned long arg)
  * Name: pwm_unlink
  *
  * Description:
- *   Handle PWM upper-half deinitialization and triggers lower-half
- *   deinitialization with pwm_ops_s.shutdown. 
+ *   Free pwm_upperhalf_s allocated by pwm_register(). Lower-half
+ *   deinitialization is assumed to be complete (fails with EBUSY if device
+ *   is open).
  *
  ****************************************************************************/
 
-static int pwm_unlink(FAR struct inode *inode) 
+static int pwm_unlink(FAR struct inode *inode)
 {
   FAR struct pwm_upperhalf_s *upper = inode->i_private;
-  FAR struct pwm_lowerhalf_s *lower = upper->dev;
-  int                         ret;
+  int ret;
 
-  // TODO free all resources associated with the PWM upper half
-  // Probably just *upper
+  ret = nxmutex_lock(&upper->lock);
+  if (ret < 0) 
+  {
+    return ret;
+  }
+
+  if (upper->crefs != 0) 
+  {
+    nxmutex_unlock(&upper->lock);
+    return -EBUSY;
+  }
+
+  nxmutex_unlock(&upper->lock);
+  nxmutex_destroy(&upper->lock);
+  kmm_free(upper);
+
+  return OK;
 }
 
 /****************************************************************************
