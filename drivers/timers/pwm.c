@@ -59,7 +59,7 @@ struct pwm_upperhalf_s
   volatile bool     started;        /* True: pulsed output is being
                                      * generated */
   bool              unlinked;       /* True: device was still open but
-                                     * will be freed on next pwm_close */
+                                     * will be freed on last pwm_close */
   mutex_t           lock;           /* Supports mutual exclusion */
   struct pwm_info_s info;           /* Pulsed output characteristics */
   FAR struct pwm_lowerhalf_s *dev;  /* lower-half state */
