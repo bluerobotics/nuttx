@@ -58,6 +58,8 @@ struct pwm_upperhalf_s
                                      * been opened */
   volatile bool     started;        /* True: pulsed output is being
                                      * generated */
+  bool              unlinked;       /* True: device was still open but
+                                     * will be freed on next pwm_close */
   mutex_t           lock;           /* Supports mutual exclusion */
   struct pwm_info_s info;           /* Pulsed output characteristics */
   FAR struct pwm_lowerhalf_s *dev;  /* lower-half state */
@@ -93,13 +95,13 @@ static const struct file_operations g_pwmops =
   pwm_write, /* write */
   NULL,      /* seek */
   pwm_ioctl, /* ioctl */
-  NULL,
-  NULL,
-  NULL,
-  NULL,
-  NULL,
+  NULL,      /* mmap */
+  NULL,      /* truncate */
+  NULL,      /* poll */
+  NULL,      /* readv */
+  NULL,      /* writev */
 #ifndef CONFIG_DISABLE_PSEUDOFS_OPERATIONS
-  pwm_unlink,
+  pwm_unlink, /* unlink */
 #endif
 };
 
@@ -251,7 +253,16 @@ static int pwm_close(FAR struct file *filep)
     }
 
   ret = OK;
-  nxmutex_unlock(&upper->lock);
+
+  if (upper->unlinked && upper->crefs == 0)
+    {
+      nxmutex_unlock(&upper->lock);
+      ret = pwm_unlink(inode);
+    }
+  else
+    {
+      nxmutex_unlock(&upper->lock);
+    }
 
 errout:
   return ret;
@@ -567,8 +578,8 @@ static int pwm_ioctl(FAR struct file *filep, int cmd, unsigned long arg)
  *
  * Description:
  *   Free pwm_upperhalf_s allocated by pwm_register(). Lower-half
- *   deinitialization is assumed to be complete (fails with EBUSY if device
- *   is open).
+ *   deinitialization is assumed to be complete. Open devices are
+ *   marked unlinked and freed on last close.
  *
  ****************************************************************************/
 
@@ -578,16 +589,17 @@ static int pwm_unlink(FAR struct inode *inode)
   int ret;
 
   ret = nxmutex_lock(&upper->lock);
-  if (ret < 0) 
-  {
-    return ret;
-  }
+  if (ret < 0)
+    {
+      return ret;
+    }
 
-  if (upper->crefs != 0) 
-  {
-    nxmutex_unlock(&upper->lock);
-    return -EBUSY;
-  }
+  if (upper->crefs != 0)
+    {
+      upper->unlinked = true;
+      nxmutex_unlock(&upper->lock);
+      return OK;
+    }
 
   nxmutex_unlock(&upper->lock);
   nxmutex_destroy(&upper->lock);
